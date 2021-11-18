@@ -53,64 +53,75 @@ pub enum SpekItem {
     Doc(String),
 }
 
+#[derive(Debug, Default, derive_more::Constructor)]
+struct State {
+    spek: Spek,
+    builder: Option<Builder>,
+}
+
 #[derive(Debug, Clone)]
 enum Builder {
     Module { name: String },
     Item { segments: Vec<String> },
 }
 
-impl Spek {
-    pub fn parse_markdown(buffer: &str) -> Spek {
+impl State {
+    fn fold_node<'a>(mut self, node: &'a Node<'a>) -> Self {
         use NodeValue::*;
-        let arena = comrak::Arena::new();
-        let root = comrak::parse_document(&arena, buffer, &Default::default());
-        let init = (Spek::default(), None);
-
-        let (spek, _) = root.children().fold(init, |(mut spek, builder), node| {
-            let data = node.data.borrow();
-            match (&data.value, builder) {
-                (Paragraph, Some(Builder::Module { name })) => {
-                    let doc = get_text(node);
-                    spek.modules.push(SpekModule::new(name, Some(doc)));
+        let data = node.data.borrow();
+        let State { mut spek, builder } = self;
+        let (spek, builder) = match (&data.value, builder) {
+            (Paragraph, Some(Builder::Module { name })) => {
+                let doc = get_text(node);
+                spek.modules.push(SpekModule::new(name, Some(doc)));
+                (spek, None)
+            }
+            (Paragraph, None) => {
+                let text = get_text(node);
+                (spek.add(SpekItem::Doc(text)), None)
+            }
+            (List(list), builder) => {
+                if let Some(Builder::Module { name }) = builder {
+                    spek.modules.push(SpekModule::new(name, None));
+                }
+                if list.bullet_char == 42 {
+                    // asterisk
+                    let items = parse_list(node);
+                    (
+                        spek.extend(items.into_iter().map(|name| SpekItem::Test {
+                            name,
+                            subs: Vec::new(),
+                        })),
+                        None,
+                    )
+                } else {
+                    println!("TODO: handle non-asterisk bullet");
                     (spek, None)
                 }
-                (Paragraph, None) => {
-                    let text = get_text(node);
-                    (spek.add(SpekItem::Doc(text)), None)
-                }
-                (List(list), builder) => {
-                    if let Some(Builder::Module { name }) = builder {
-                        spek.modules.push(SpekModule::new(name, None));
-                    }
-                    if list.bullet_char == 42 {
-                        // asterisk
-                        let items = parse_list(node);
-                        (
-                            spek.extend(items.into_iter().map(|name| SpekItem::Test {
-                                name,
-                                subs: Vec::new(),
-                            })),
-                            None,
-                        )
-                    } else {
-                        println!("TODO: handle non-asterisk bullet");
-                        (spek, None)
-                    }
-                }
-                (Heading(heading), None) => {
-                    let name = get_text(node);
-                    if heading.level == 1 {
-                        (spek, Some(Builder::Module { name }))
-                    } else {
-                        todo!()
-                    }
-                }
-                (v, b) => {
-                    dbg!(v);
-                    (spek, b)
+            }
+            (Heading(heading), None) => {
+                let name = get_text(node);
+                if heading.level == 1 {
+                    (spek, Some(Builder::Module { name }))
+                } else {
+                    todo!()
                 }
             }
-        });
+            (v, b) => {
+                dbg!(v);
+                (spek, b)
+            }
+        };
+        State::new(spek, builder)
+    }
+}
+
+impl Spek {
+    pub fn from_markdown(buffer: &str) -> Spek {
+        let arena = comrak::Arena::new();
+        let root = comrak::parse_document(&arena, buffer, &Default::default());
+        let init = State::default();
+        let State { spek, .. } = root.children().fold(init, State::fold_node);
         spek
     }
 }
@@ -138,8 +149,8 @@ fn get_text(node: &Node) -> String {
 }
 
 #[test]
-fn test_parse_markdown() {
-    let spek = Spek::parse_markdown(
+fn test_from_markdown() {
+    let spek = Spek::from_markdown(
         r"
 # Module 1
 
