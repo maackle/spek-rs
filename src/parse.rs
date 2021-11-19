@@ -26,6 +26,11 @@ impl Spek {
     fn add(mut self, item: SpekItem) -> Self {
         self.extend([item].into_iter())
     }
+
+    fn add_module(mut self, module: SpekModule) -> Self {
+        self.modules.push(module);
+        self
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -53,7 +58,7 @@ pub enum SpekItem {
     Doc(String),
 }
 
-#[derive(Debug, Default, derive_more::Constructor)]
+#[derive(Debug, Default, derive_more::Constructor, derive_more::Into)]
 struct State {
     spek: Spek,
     builder: Option<Builder>,
@@ -61,55 +66,92 @@ struct State {
 
 #[derive(Debug, Clone)]
 enum Builder {
-    Module { name: String },
+    Module { name: String, doc: String },
     Item { segments: Vec<String> },
+    Doc { chunks: Vec<String> },
+}
+
+#[derive(derive_more::From)]
+enum SpekBuilt {
+    Module(SpekModule),
+    Item(SpekItem),
+}
+
+impl Builder {
+    fn finish(self) -> SpekBuilt {
+        match self {
+            Self::Doc {chunks} => SpekItem::Doc(chunks.join("\n")).into(),
+            Self::Item { segments } => {
+                assert_eq!(segments.len(), 1, "multi-segment test items not supported");
+                SpekItem::Test { name: segments.first().unwrap().clone(), subs: vec![]}.into()
+            },
+            Self::Module { name, doc } => SpekModule::new(name, Some(doc)).into()
+        }
+    }
 }
 
 impl State {
-    fn fold_node<'a>(mut self, node: &'a Node<'a>) -> Self {
+
+    fn finish_builder(self, val: &NodeValue) -> Self {
+        use NodeValue::*;
+        let (spek, builder) = match self.builder {
+            Builder::Doc { _ } => {
+                match val {
+                    Text(_) | List(_) | Item(_) => { todo!()}
+                    _ => (spek.add(SpekItem::Doc()))
+                }
+            }
+        }
+        self.spek
+                        .add_module(SpekModule::new(name.clone(), Some(doc))),
+    }
+    fn fold_node<'a>(self, node: &'a Node<'a>) -> Self {
         use NodeValue::*;
         let data = node.data.borrow();
-        let State { mut spek, builder } = self;
-        let (spek, builder) = match (&data.value, builder) {
-            (Paragraph, Some(Builder::Module { name })) => {
-                let doc = get_text(node);
-                spek.modules.push(SpekModule::new(name, Some(doc)));
-                (spek, None)
-            }
-            (Paragraph, None) => {
-                let text = get_text(node);
-                (spek.add(SpekItem::Doc(text)), None)
+        let (spek, builder) = match (&data.value, self.builder) {
+            (Paragraph, _) => node.children().fold(self, State::fold_node).into(),
+            (Text(bytes), builder) => {
+                let text = std::str::from_utf8(&bytes)
+                    .expect("not valid utf8")
+                    .to_string();
+                match builder {
+                    Some(Builder::Doc { chunks }) => chunks.push(text),
+                    _ => todo!(),
+                }
+                (self.spek.add(SpekItem::Doc(text)), None)
             }
             (List(list), builder) => {
-                if let Some(Builder::Module { name }) = builder {
-                    spek.modules.push(SpekModule::new(name, None));
-                }
+                let spek = if let Some(Builder::Module { name }) = &builder {
+                    self.spek.add_module(SpekModule::new(name.to_owned(), None))
+                } else {
+                    self.spek
+                };
                 if list.bullet_char == 42 {
                     // asterisk
-                    let items = parse_list(node);
-                    (
-                        spek.extend(items.into_iter().map(|name| SpekItem::Test {
-                            name,
-                            subs: Vec::new(),
-                        })),
-                        None,
-                    )
+                    node.children()
+                        .fold(State::new(spek, builder), State::fold_node)
+                        .into()
                 } else {
                     println!("TODO: handle non-asterisk bullet");
                     (spek, None)
                 }
             }
+            (Item(list), builder) => {
+                // TODO: allow nested items for "subs" and ellipses expansion
+                let name = item_text(node);
+                (self.spek.add(SpekItem::Test { name, subs: vec![] }), None)
+            }
             (Heading(heading), None) => {
                 let name = get_text(node);
                 if heading.level == 1 {
-                    (spek, Some(Builder::Module { name }))
+                    (self.spek, Some(Builder::Module { name }))
                 } else {
                     todo!()
                 }
             }
             (v, b) => {
                 dbg!(v);
-                (spek, b)
+                (self.spek, b)
             }
         };
         State::new(spek, builder)
@@ -126,27 +168,27 @@ impl Spek {
     }
 }
 
-fn parse_list<'a>(node: &'a Node<'a>) -> Vec<String> {
-    node.children().map(item_text).collect()
-}
+// fn parse_list<'a>(node: &'a Node<'a>) -> Vec<String> {
+//     node.children().map(item_text).collect()
+// }
 
-fn item_text(node: &Node) -> String {
-    get_text(node.first_child().expect("empty item"))
-}
+// fn item_text(node: &Node) -> String {
+//     get_text(node.first_child().expect("empty item"))
+// }
 
-fn get_text(node: &Node) -> String {
-    node.first_child()
-        .map(|c| {
-            if let NodeValue::Text(bytes) = &c.data.borrow().value {
-                std::str::from_utf8(&bytes)
-                    .expect("not valid utf8")
-                    .to_string()
-            } else {
-                todo!("handle non-text first child")
-            }
-        })
-        .expect("empty item")
-}
+// fn get_text(node: &Node) -> String {
+//     node.first_child()
+//         .map(|c| {
+//             if let NodeValue::Text(bytes) = &c.data.borrow().value {
+//                 std::str::from_utf8(&bytes)
+//                     .expect("not valid utf8")
+//                     .to_string()
+//             } else {
+//                 todo!("handle non-text first child")
+//             }
+//         })
+//         .expect("empty item")
+// }
 
 #[test]
 fn test_from_markdown() {
